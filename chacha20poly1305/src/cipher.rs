@@ -8,7 +8,6 @@ use poly1305::{
     universal_hash::{NewUniversalHash, UniversalHash},
     Poly1305,
 };
-use zeroize::Zeroize;
 
 use super::Tag;
 
@@ -33,15 +32,15 @@ where
     C: StreamCipher + StreamCipherSeek,
 {
     /// Instantiate the underlying cipher with a particular nonce
-    pub(crate) fn new(mut cipher: C) -> Self {
+    pub(crate) fn new(cipher: C) -> Self {
         // Derive Poly1305 key from the first 32-bytes of the ChaCha20 keystream
-        let mut mac_key = poly1305::Key::default();
-        cipher.apply_keystream(&mut *mac_key);
+        let mac_key = poly1305::Key::default();
+        //cipher.apply_keystream(&mut *mac_key);
         let mac = Poly1305::new(GenericArray::from_slice(&*mac_key));
-        mac_key.zeroize();
+        //mac_key.zeroize();
 
         // Set ChaCha20 counter to 1
-        cipher.seek(BLOCK_SIZE as u64);
+        //cipher.seek(BLOCK_SIZE as u64);
 
         Self { cipher, mac }
     }
@@ -49,21 +48,45 @@ where
     /// Encrypt the given message in-place, returning the authentication tag
     pub(crate) fn encrypt_in_place_detached(
         mut self,
-        associated_data: &[u8],
+        _associated_data: &[u8],
         buffer: &mut [u8],
+        core_id: usize,
+        num_cores: usize,
     ) -> Result<Tag, Error> {
         if buffer.len() / BLOCK_SIZE >= MAX_BLOCKS {
             return Err(Error);
         }
 
-        self.mac.update_padded(associated_data);
+        let chunk = (buffer.len() / BLOCK_SIZE + num_cores - 1) / num_cores;
+        let start = chunk * core_id * BLOCK_SIZE;
+        //.mac.update_padded(associated_data);
+
+        // TODO(tarcieri): interleave encryption with Poly1305
+        // See: <https://github.com/RustCrypto/AEADs/issues/74>
+        self.cipher.seek(start);
+        self.cipher.apply_keystream(&mut buffer[start..start + chunk * BLOCK_SIZE]);
+        //self.mac.update_padded(buffer);
+
+        //self.authenticate_lengths(associated_data, buffer)?;
+        Ok(self.mac.finalize().into_bytes())
+    }
+
+    pub(crate) fn encrypt_in_place_detached_2(
+        mut self,
+        _associated_data: &[u8],
+        buffer: &mut [u8]
+    ) -> Result<Tag, Error> {
+        if buffer.len() / BLOCK_SIZE >= MAX_BLOCKS {
+            return Err(Error);
+        }
+        //.mac.update_padded(associated_data);
 
         // TODO(tarcieri): interleave encryption with Poly1305
         // See: <https://github.com/RustCrypto/AEADs/issues/74>
         self.cipher.apply_keystream(buffer);
-        self.mac.update_padded(buffer);
+        //self.mac.update_padded(buffer);
 
-        self.authenticate_lengths(associated_data, buffer)?;
+        //self.authenticate_lengths(associated_data, buffer)?;
         Ok(self.mac.finalize().into_bytes())
     }
 

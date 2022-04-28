@@ -260,6 +260,40 @@ where
     type CiphertextOverhead = U0;
 }
 
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_panic: &PanicInfo<'_>) -> ! {
+    loop {}
+}
+
+impl<C, N> ChaChaPoly1305<C, N>
+where
+    C: KeyIvInit<KeySize = U32, IvSize = N> + StreamCipher + StreamCipherSeek,
+    N: ArrayLength<u8>,
+{
+    fn encrypt_in_place_detached(
+        &self,
+        nonce: &aead::Nonce<Self>,
+        associated_data: &[u8],
+        buffer: &mut [u8],
+        core_id: usize,
+        num_cores: usize,
+    ) -> Result<Tag, Error> {
+        Cipher::new(C::new(&self.key, nonce)).encrypt_in_place_detached(associated_data, buffer,core_id,
+            num_cores)
+    }
+
+    fn encrypt_in_place_detached_2(
+        &self,
+        nonce: &aead::Nonce<Self>,
+        associated_data: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<Tag, Error> {
+        Cipher::new(C::new(&self.key, nonce)).encrypt_in_place_detached_2(associated_data, buffer)
+    }
+}
+
 impl<C, N> AeadInPlace for ChaChaPoly1305<C, N>
 where
     C: KeyIvInit<KeySize = U32, IvSize = N> + StreamCipher + StreamCipherSeek,
@@ -271,7 +305,8 @@ where
         associated_data: &[u8],
         buffer: &mut [u8],
     ) -> Result<Tag, Error> {
-        Cipher::new(C::new(&self.key, nonce)).encrypt_in_place_detached(associated_data, buffer)
+        Cipher::new(C::new(&self.key, nonce)).encrypt_in_place_detached(associated_data, buffer,0,
+            1)
     }
 
     fn decrypt_in_place_detached(
@@ -310,4 +345,98 @@ where
     fn drop(&mut self) {
         self.key.as_mut_slice().zeroize();
     }
+}
+
+
+struct PulpWrapper {
+    func: extern "C" fn(*mut cty::c_void),
+    cores: usize,
+    data: *mut cty::c_void,
+}
+
+extern "C" {
+    pub fn pi_cl_team_fork_tmp(num_cores: usize, cluster_fn: extern "C" fn(*mut cty::c_void), args: *mut cty::c_void);
+}
+extern "C"{
+    pub fn pi_l2_malloc_align(size: cty::c_int, align: cty::c_int) -> *mut cty::c_void;
+}
+extern "C" {
+    pub fn bsp_init();
+}
+extern "C" {
+   pub fn pi_l2_malloc(size: cty::c_int) -> *mut cty::c_int;
+}
+
+impl PulpWrapper {
+    #[no_mangle]
+    fn new(func: extern "C" fn(*mut cty::c_void), cores: usize, data: CoreData<'_>) -> Self{
+        let align = core::mem::align_of::<CoreData<'_>>();
+        let size = core::mem::size_of::<CoreData<'_>>();
+        assert_eq!(align, 4);
+        let ptr = 
+        unsafe {
+            // TODO: we need pi_l2_malloc_align();
+            let raw_ptr = pi_l2_malloc(size as cty::c_int);
+            let data_ptr =  &mut *(raw_ptr as *mut CoreData<'_>);
+            // Do not call drop on uninitialized memory
+            core::ptr::write(data_ptr, data);
+            raw_ptr as *mut cty::c_void
+        };
+        
+        Self { cores, func, data: ptr }
+    }
+
+    #[no_mangle]
+    pub fn run(self) {
+        unsafe { pi_cl_team_fork_tmp(self.cores, self.func, self.data) };
+    }
+}
+
+fn pi_core_id() -> usize {
+    let core_id: usize;
+    unsafe {
+        core::arch::asm!("csrr {core_id}, 0x014", core_id = out(reg) core_id,);
+    }
+    core_id & 0x01f
+}
+
+#[no_mangle]
+extern "C" fn entry_point(data: *mut cty::c_void) {
+    let data: &mut CoreData<'_> = unsafe { &mut *(data as *mut CoreData<'_>) };
+    let nonce = Nonce::from_slice(&[0u8; 12]);
+    let CoreData {
+        ref mut data, chacha, cores
+    } = data;
+    chacha.encrypt_in_place_detached(nonce, b"", data, pi_core_id(), *cores).unwrap();
+}
+
+struct CoreData<'a> {
+    data: &'a mut [u8],
+    cores: usize,
+    chacha: ChaCha20Poly1305,
+}
+
+/// ChaCha20 encrypt function
+#[no_mangle]
+pub extern "C" fn encrypt(data: *mut u8, len: usize, key: *const u8, num_cores: cty::size_t) {
+    let data = unsafe { core::slice::from_raw_parts_mut(data, len) };
+    let key = Key::from_slice(unsafe { core::slice::from_raw_parts(key, 32) });
+    let chacha = ChaCha20Poly1305::new(key);
+    let core_data = CoreData {
+        data, 
+        chacha,
+        cores: num_cores
+    };
+    let wrapper = PulpWrapper::new(entry_point, num_cores, core_data);
+    wrapper.run();
+    //data[0] = 66;
+}
+
+#[no_mangle]
+pub extern "C" fn encrypt_serial(data: *mut u8, len: usize, key: *const u8) {
+    let data = unsafe { core::slice::from_raw_parts_mut(data, len) };
+    let key = Key::from_slice(unsafe { core::slice::from_raw_parts(key, 32) });
+    let chacha = ChaCha20Poly1305::new(key);
+    let nonce = Nonce::from_slice(&[0u8; 12]);
+    chacha.encrypt_in_place_detached_2(nonce, b"", data).unwrap();
 }
